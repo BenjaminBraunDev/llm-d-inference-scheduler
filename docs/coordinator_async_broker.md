@@ -122,9 +122,8 @@ All params and their defaults are documented in `pkg/coordinator/steps/async_bro
 | Connection hold | to the deadline, or `wait_cap_seconds` if set | none, 202 returns immediately | no connection |
 | Result TTL | deleted on delivery. On 202 fallback, `result_ttl_seconds` from the AP queue config | `result_ttl_seconds` from the AP queue config | belt drained destructively, no TTL unless configured |
 | Post-fetch grace | 60s after a delivered fetch | 60s after a delivered fetch | none, pops cannot re-fetch |
-| Per-attempt send timeout | AP `--request-timeout` flag, 5m default | same | same |
 
-The request deadline governs total life (queue wait plus dispatch plus generation) and is enforced by the AP. The result TTL starts when the result is written. Held connections clear the server write deadline.
+The request deadline governs total life (queue wait plus dispatch plus generation) and is enforced by the AP. The result TTL starts when the result is written. Held connections clear the server write deadline. Each dispatch attempt is additionally bounded by the AP's `--request-timeout` flag (5m default).
 
 ## Deployment notes
 
