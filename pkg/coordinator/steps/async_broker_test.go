@@ -299,6 +299,58 @@ func TestAsyncBrokerWaitCapFallsBackToPending(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "pending")
 }
 
+func TestAsyncBrokerWaitDeadlineAnswersTimeout(t *testing.T) {
+	step, _ := newAsyncTestStep(t, map[string]any{
+		"timeouts": map[string]any{"wait": map[string]any{"default_seconds": 1}},
+	})
+	reqCtx, rec := asyncReqCtx(t, `{"model":"test-model"}`,
+		map[string]string{"X-AP-Mode": "wait", "X-Team": "team-a"})
+
+	start := time.Now()
+	err := step.Execute(t.Context(), reqCtx)
+	require.True(t, errors.Is(err, pipeline.ErrPipelineDone))
+	assert.GreaterOrEqual(t, time.Since(start), time.Second)
+	assert.Equal(t, http.StatusGatewayTimeout, rec.Code)
+	assert.Contains(t, rec.Body.String(), api.ErrCodeDeadlineExceeded)
+}
+
+func TestAsyncBrokerDeadlineClamping(t *testing.T) {
+	readDeadline := func(t *testing.T, rdb *redis.Client) int64 {
+		t.Helper()
+		members, err := rdb.ZRange(t.Context(), "team-default-queue", 0, -1).Result()
+		require.NoError(t, err)
+		require.Len(t, members, 1)
+		var envelope struct {
+			Data api.RequestMessage `json:"data"`
+		}
+		require.NoError(t, json.Unmarshal([]byte(members[0]), &envelope))
+		return envelope.Data.Deadline
+	}
+	headers := map[string]string{
+		"X-AP-Mode":                 "enqueue",
+		"X-Team":                    "team-a",
+		"X-Request-Timeout-Seconds": "1000000",
+	}
+
+	t.Run("unclamped when no max configured", func(t *testing.T) {
+		step, rdb := newAsyncTestStep(t, nil)
+		reqCtx, rec := asyncReqCtx(t, `{"model":"test-model"}`, headers)
+		require.True(t, errors.Is(step.Execute(t.Context(), reqCtx), pipeline.ErrPipelineDone))
+		require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
+		assert.InDelta(t, time.Now().Add(1000000*time.Second).Unix(), readDeadline(t, rdb), 5)
+	})
+
+	t.Run("clamped when max configured", func(t *testing.T) {
+		step, rdb := newAsyncTestStep(t, map[string]any{
+			"timeouts": map[string]any{"enqueue": map[string]any{"max_seconds": 300}},
+		})
+		reqCtx, rec := asyncReqCtx(t, `{"model":"test-model"}`, headers)
+		require.True(t, errors.Is(step.Execute(t.Context(), reqCtx), pipeline.ErrPipelineDone))
+		require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
+		assert.InDelta(t, time.Now().Add(300*time.Second).Unix(), readDeadline(t, rdb), 5)
+	})
+}
+
 func TestAsyncBrokerPassthroughStampsAndClassifies(t *testing.T) {
 	step, _ := newAsyncTestStep(t, nil)
 

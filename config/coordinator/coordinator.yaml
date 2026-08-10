@@ -130,8 +130,9 @@ pipeline:
     #     quota:
     #       limits:
     #         team-a: 8
-    #     # wait_cap_seconds bounds held wait connections; keep it below
-    #     # the server write_timeout. Default 55.
+    #     # wait_cap_seconds bounds held wait connections, ending the hold
+    #     # with the 202 response. Holds otherwise run to the request
+    #     # deadline.
     #     # wait_cap_seconds: 55
 
     # -------------------------------------------------------------------

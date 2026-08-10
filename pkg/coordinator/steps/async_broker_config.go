@@ -46,10 +46,7 @@ const (
 	resultKeyPrefix = "results:req:"
 
 	defaultAsyncTimeoutSecs   = 60
-	defaultAsyncMaxTimeout    = 600
 	defaultEnqueueTimeoutSecs = 3600
-	defaultEnqueueMaxTimeout  = 86400
-	defaultWaitCapSecs        = 55
 )
 
 // asyncRoute maps a request to a broker queue and tier. Empty Model or Tenant
@@ -105,19 +102,22 @@ type asyncBrokerConfig struct {
 	// TenantHeader names the header carrying the tenant key (default X-Team).
 	TenantHeader string `json:"tenant_header,omitempty"`
 	// TimeoutHeader lets clients request a deadline in seconds for the queued
-	// modes (default X-Request-Timeout-Seconds), capped per mode by Timeouts.
+	// modes (default X-Request-Timeout-Seconds). Clamped per mode only when a
+	// max is configured, unbounded otherwise.
 	TimeoutHeader string `json:"timeout_header,omitempty"`
 
 	// DefaultTimeoutSeconds and MaxTimeoutSeconds are the fallback deadline
-	// bounds for queued modes without an entry in Timeouts.
+	// bounds for queued modes without an entry in Timeouts. A zero max means
+	// no clamp.
 	DefaultTimeoutSeconds int64 `json:"default_timeout_seconds,omitempty"`
 	MaxTimeoutSeconds     int64 `json:"max_timeout_seconds,omitempty"`
 	// Timeouts overrides the deadline bounds per queued mode ("enqueue",
 	// "wait"). Enqueue defaults much higher than wait: deferred work
 	// legitimately outlives any connection.
 	Timeouts map[string]asyncTimeoutBounds `json:"timeouts,omitempty"`
-	// WaitCapSeconds bounds how long wait mode holds a connection. Keep it
-	// below the coordinator server's write_timeout.
+	// WaitCapSeconds, when > 0, bounds how long wait mode holds a connection
+	// before falling back to the enqueue response. Unset, the hold runs to
+	// the request deadline.
 	WaitCapSeconds int64 `json:"wait_cap_seconds,omitempty"`
 
 	// Routes select the broker queue and tier per request. The queues must
@@ -165,9 +165,6 @@ func (c *asyncBrokerConfig) applyDefaults() {
 	if c.DefaultTimeoutSeconds <= 0 {
 		c.DefaultTimeoutSeconds = defaultAsyncTimeoutSecs
 	}
-	if c.MaxTimeoutSeconds <= 0 {
-		c.MaxTimeoutSeconds = defaultAsyncMaxTimeout
-	}
 	if c.Timeouts == nil {
 		c.Timeouts = map[string]asyncTimeoutBounds{}
 	}
@@ -177,11 +174,7 @@ func (c *asyncBrokerConfig) applyDefaults() {
 	if _, ok := c.Timeouts[string(asyncModeEnqueue)]; !ok {
 		c.Timeouts[string(asyncModeEnqueue)] = asyncTimeoutBounds{
 			DefaultSeconds: defaultEnqueueTimeoutSecs,
-			MaxSeconds:     defaultEnqueueMaxTimeout,
 		}
-	}
-	if c.WaitCapSeconds <= 0 {
-		c.WaitCapSeconds = defaultWaitCapSecs
 	}
 	if c.DefaultQueue == "" {
 		c.DefaultQueue = "request-sortedset"
@@ -220,9 +213,15 @@ func (c *asyncBrokerConfig) validate() error {
 	default:
 		return fmt.Errorf("wakeup_mode must be auto, notify, or poll, got %q", c.WakeupMode)
 	}
-	for mode := range c.Timeouts {
+	if c.MaxTimeoutSeconds > 0 && c.DefaultTimeoutSeconds > c.MaxTimeoutSeconds {
+		return fmt.Errorf("default_timeout_seconds %d exceeds max_timeout_seconds %d", c.DefaultTimeoutSeconds, c.MaxTimeoutSeconds)
+	}
+	for mode, b := range c.Timeouts {
 		if mode != string(asyncModeEnqueue) && mode != string(asyncModeWait) {
 			return fmt.Errorf("timeouts keys must be enqueue or wait, got %q", mode)
+		}
+		if b.MaxSeconds > 0 && b.DefaultSeconds > b.MaxSeconds {
+			return fmt.Errorf("timeouts.%s: default_seconds %d exceeds max_seconds %d", mode, b.DefaultSeconds, b.MaxSeconds)
 		}
 	}
 	for _, h := range c.ForwardHeaders {

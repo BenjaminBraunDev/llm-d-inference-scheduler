@@ -46,7 +46,7 @@ HTTP/1.1 200 OK                    # the model's response, upstream status mirro
 
 After a successful fetch delivery the result's TTL is shrunk to a 60 second grace window, so a client that lost the response can re-fetch while unfetched results do not linger past the grace period.
 
-**Wait** returns the model's response on the original connection with the upstream status mirrored, exactly as if the model server had answered directly, and the delivered result is deleted eagerly. Wake-up is a Redis keyspace notification on the result key, with a polling fallback when notifications are unavailable. If the result does not land within the wait cap, the client gets the enqueue response (202 plus id) and can fetch later. If the client disconnects, the step cancels the request pre-dispatch.
+**Wait** returns the model's response on the original connection with the upstream status mirrored, exactly as if the model server had answered directly, and the delivered result is deleted eagerly. Wake-up is a Redis keyspace notification on the result key, with a polling fallback when notifications are unavailable. The hold runs to the request deadline and answers 504 there, or ends early at `wait_cap_seconds` with the 202 response, leaving the request fetchable. If the client disconnects, the step cancels the request pre-dispatch.
 
 **Passthrough** classifies and stamps, then lets the pipeline continue, so streaming and upstream errors behave exactly as they do without the step.
 
@@ -106,15 +106,29 @@ To enable the step, add this block as the first entry under `steps:` in the coor
 | `default_queue` | `request-sortedset` | queue for requests matching no route |
 | `objectives` | none | InferenceObjective names stamped per tier, selected by quota classification |
 | `quota` | prefix `quota:`, attribute `team`, window 300s | reserved concurrency limits per tenant, counters shared with the AP's redis-quota gate. Tenants without an entry are always classified reserved |
-| `timeouts` | wait 60s default 600s max, enqueue 1h default 24h max | deadline bounds per queued mode |
-| `wait_cap_seconds` | 55 | bounds held wait connections, keep it below the server write timeout |
+| `timeouts` | wait 60s, enqueue 1h | deadline bounds per queued mode, `max_seconds` caps client requested deadlines |
+| `wait_cap_seconds` | none | bounds held wait connections, ending the hold with the 202 response |
 | `wakeup_mode` | `auto` | `notify`, `poll`, or `auto` which probes for keyspace notification support |
 | `forward_headers` | SLO headers | allowlisted client headers forwarded on queued messages. The mode, objective, and fairness headers are rejected here |
 
 All params and their defaults are documented in `pkg/coordinator/steps/async_broker_config.go`, and a commented example lives in `config/coordinator/coordinator.yaml`.
 
+## Timeouts and TTLs
+
+| Clock | Wait | Enqueue | Raw producer |
+| :---- | :---- | :---- | :---- |
+| Request deadline default | 60s | 1h | none, producer supplies one |
+| Request deadline max | `timeouts.wait.max_seconds` | `timeouts.enqueue.max_seconds` | none |
+| Connection hold | to the deadline, or `wait_cap_seconds` if set | none, 202 returns immediately | no connection |
+| Result TTL | deleted on delivery. On 202 fallback, `result_ttl_seconds` from the AP queue config | `result_ttl_seconds` from the AP queue config | belt drained destructively, no TTL unless configured |
+| Post-fetch grace | 60s after a delivered fetch | 60s after a delivered fetch | none, pops cannot re-fetch |
+| Per-attempt send timeout | AP `--request-timeout` flag, 5m default | same | same |
+
+The request deadline governs total life (queue wait plus dispatch plus generation) and is enforced by the AP. The result TTL starts when the result is written. Held connections clear the server write deadline.
+
 ## Deployment notes
 
+- Set `result_ttl_seconds` on every AP queue the step feeds, or unfetched results never expire.
 - Redis needs keyspace notifications enabled for the wait wake-up (`notify-keyspace-events Kl`). The step detects their absence and falls back to polling.
 - Wait mode holds one gateway to coordinator connection per waiting client, so the gateway's circuit breaker limits on the coordinator cluster must be sized for held connections, not request rate. Envoy defaults are far too low.
 - `preserve_external_request_id` should be set on the gateway so client supplied request ids survive the hop for retry and fetch by id.
